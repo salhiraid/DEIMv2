@@ -167,6 +167,7 @@ class TransformerDecoder(nn.Module):
 
         dec_out_bboxes = []
         dec_out_logits = []
+        dec_out_embeddings = []
         dec_out_pred_corners = []
         dec_out_refs = []
         if not hasattr(self, 'project'):
@@ -204,6 +205,8 @@ class TransformerDecoder(nn.Module):
                 scores = self.lqe_layers[i](scores, pred_corners)
                 dec_out_logits.append(scores)
                 dec_out_bboxes.append(inter_ref_bbox)
+                # Per-query appearance embedding from the current decoder layer.
+                dec_out_embeddings.append(output)
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)
 
@@ -214,7 +217,7 @@ class TransformerDecoder(nn.Module):
             ref_points_detach = inter_ref_bbox.detach()
             output_detach = output.detach()
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), torch.stack(dec_out_embeddings), \
                torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores
 
 
@@ -544,7 +547,7 @@ class DEIMTransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
 
         # decoder
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        out_bboxes, out_logits, out_embeddings, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -566,6 +569,7 @@ class DEIMTransformer(nn.Module):
 
             dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
+            _, out_embeddings = torch.split(out_embeddings, dn_meta['dn_num_split'], dim=2)
 
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
@@ -574,7 +578,7 @@ class DEIMTransformer(nn.Module):
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_corners': out_corners[-1],
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}
         else:
-            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+            out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1], 'pred_embeddings': out_embeddings[-1]}
 
         if self.training and self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1],
