@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analyze tracking consistency using saved per-frame detection embeddings.
+Analyze temporal track consistency using saved per-frame detection embeddings.
 
 Example:
 python analyze_track_embedding_consistency.py \
@@ -10,10 +10,14 @@ python analyze_track_embedding_consistency.py \
     --iou_thr 0.30 \
     --min_track_len 3
 
-Strategy:
-- Match each track box to the single best-IoU detection in the same frame.
+Primary strategy:
+- Match each GT track box to the single best-IoU detection in the same frame.
 - Reject matches with IoU < threshold.
-- Compute cosine similarity stability metrics per track.
+- For a valid track at frame t, use the same track's matched embedding at frame t-1
+  as the reference embedding.
+- Compare that reference embedding against every detection embedding at frame t.
+- Report whether the GT-matched detection at frame t is also the strongest cosine
+  match for the previous-frame reference.
 """
 
 from __future__ import annotations
@@ -61,12 +65,18 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom)
 
 
-def pairwise_cosine_matrix(embeddings: np.ndarray) -> np.ndarray:
-    if embeddings.size == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    emb = embeddings / np.clip(norms, 1e-12, None)
-    return (emb @ emb.T).astype(np.float32)
+def cosine_similarities_to_candidates(reference: np.ndarray, candidates: np.ndarray) -> np.ndarray:
+    if candidates.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    ref = np.asarray(reference, dtype=np.float32)
+    ref_norm = np.linalg.norm(ref)
+    if ref_norm <= 1e-12:
+        return np.zeros((candidates.shape[0],), dtype=np.float32)
+    ref = ref / ref_norm
+    cand = np.asarray(candidates, dtype=np.float32)
+    cand_norms = np.linalg.norm(cand, axis=1, keepdims=True)
+    cand = cand / np.clip(cand_norms, 1e-12, None)
+    return (cand @ ref).astype(np.float32)
 
 
 def load_tracks_txt(txt_path: Path):
@@ -161,43 +171,95 @@ def match_tracks_to_detections(
     return rows
 
 
-def summarize_track(track_df: pd.DataFrame) -> Dict[str, object]:
-    track_df = track_df.sort_values("frame_idx").reset_index(drop=True)
-    embeddings = np.stack(track_df["embedding"].to_numpy(), axis=0).astype(np.float32)
+def build_temporal_comparison_rows(
+    matches_df: pd.DataFrame,
+    detections_by_frame: Dict[int, Dict[str, np.ndarray]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
 
-    ref = embeddings[0]
-    sim_to_first = np.array([cosine_similarity(e, ref) for e in embeddings], dtype=np.float32)
+    for track_id, group in matches_df.groupby("track_id", sort=True):
+        group = group.sort_values("frame_idx").reset_index(drop=True)
+        for i in range(1, len(group)):
+            prev_row = group.iloc[i - 1]
+            curr_row = group.iloc[i]
 
-    if len(embeddings) >= 2:
-        cons_sim = np.array([
-            cosine_similarity(embeddings[i], embeddings[i - 1])
-            for i in range(1, len(embeddings))
-        ], dtype=np.float32)
-    else:
-        cons_sim = np.zeros((0,), dtype=np.float32)
+            frame_t_minus_1 = int(prev_row["frame_idx"])
+            frame_t = int(curr_row["frame_idx"])
+            if frame_t != frame_t_minus_1 + 1:
+                continue
 
-    pairwise = pairwise_cosine_matrix(embeddings)
-    upper_vals = pairwise[np.triu_indices(pairwise.shape[0], k=1)] if pairwise.shape[0] > 1 else np.zeros((0,), dtype=np.float32)
+            frame_det = detections_by_frame.get(frame_t)
+            if frame_det is None:
+                continue
 
-    stats_source = sim_to_first
+            candidate_embeddings = frame_det["embeddings"]
+            if candidate_embeddings.size == 0:
+                continue
+
+            matched_idx = int(curr_row["det_idx_in_frame"])
+            if matched_idx < 0 or matched_idx >= candidate_embeddings.shape[0]:
+                continue
+
+            similarities = cosine_similarities_to_candidates(
+                np.asarray(prev_row["embedding"], dtype=np.float32),
+                candidate_embeddings,
+            )
+            if similarities.size == 0:
+                continue
+
+            matched_cosine = float(similarities[matched_idx])
+            best_idx = int(np.argmax(similarities))
+            best_cosine = float(similarities[best_idx])
+            matched_rank = int(1 + np.count_nonzero(similarities > matched_cosine))
+
+            rows.append({
+                "track_id": int(track_id),
+                "frame_t_minus_1": frame_t_minus_1,
+                "frame_t": frame_t,
+                "matched_cosine": matched_cosine,
+                "matched_rank": matched_rank,
+                "best_cosine": best_cosine,
+                "is_top1_match": bool(matched_rank == 1),
+                "num_candidates_t": int(similarities.shape[0]),
+                "matched_det_idx_t": matched_idx,
+                "best_det_idx_t": best_idx,
+                "prev_detection_id": int(prev_row["detection_id"]),
+                "matched_detection_id_t": int(curr_row["detection_id"]),
+                "prev_iou": float(prev_row["iou"]),
+                "matched_iou_t": float(curr_row["iou"]),
+                "prev_score": float(prev_row["score"]),
+                "matched_score_t": float(curr_row["score"]),
+                "matched_label_t": int(curr_row["label"]),
+                "matched_label_name_t": str(curr_row["label_name"]),
+            })
+
+    return rows
+
+
+def summarize_temporal_track(
+    temporal_df: pd.DataFrame,
+    matched_track_length: int,
+) -> Dict[str, object]:
+    matched_cosines = temporal_df["matched_cosine"].to_numpy(dtype=np.float32)
+    matched_ranks = temporal_df["matched_rank"].to_numpy(dtype=np.float32)
+    best_cosines = temporal_df["best_cosine"].to_numpy(dtype=np.float32)
+    is_top1 = temporal_df["is_top1_match"].to_numpy(dtype=np.float32)
+
     return {
-        "track_id": int(track_df["track_id"].iloc[0]),
-        "track_length": int(len(track_df)),
-        "num_matched": int(len(track_df)),
-        "sim_to_first_mean": float(np.mean(stats_source)) if stats_source.size else np.nan,
-        "sim_to_first_std": float(np.std(stats_source)) if stats_source.size else np.nan,
-        "sim_to_first_var": float(np.var(stats_source)) if stats_source.size else np.nan,
-        "sim_to_first_min": float(np.min(stats_source)) if stats_source.size else np.nan,
-        "sim_to_first_max": float(np.max(stats_source)) if stats_source.size else np.nan,
-        "sim_to_first_median": float(np.median(stats_source)) if stats_source.size else np.nan,
-        "consecutive_mean": float(np.mean(cons_sim)) if cons_sim.size else np.nan,
-        "consecutive_std": float(np.std(cons_sim)) if cons_sim.size else np.nan,
-        "pairwise_mean": float(np.mean(upper_vals)) if upper_vals.size else np.nan,
-        "pairwise_std": float(np.std(upper_vals)) if upper_vals.size else np.nan,
-        "embeddings": embeddings,
-        "sim_to_first": sim_to_first,
-        "consecutive_sim": cons_sim,
-        "pairwise_matrix": pairwise,
+        "track_id": int(temporal_df["track_id"].iloc[0]),
+        "matched_track_length": int(matched_track_length),
+        "num_temporal_pairs": int(len(temporal_df)),
+        "matched_cosine_mean": float(np.mean(matched_cosines)) if matched_cosines.size else np.nan,
+        "matched_cosine_std": float(np.std(matched_cosines)) if matched_cosines.size else np.nan,
+        "matched_cosine_min": float(np.min(matched_cosines)) if matched_cosines.size else np.nan,
+        "matched_cosine_max": float(np.max(matched_cosines)) if matched_cosines.size else np.nan,
+        "matched_cosine_median": float(np.median(matched_cosines)) if matched_cosines.size else np.nan,
+        "best_cosine_mean": float(np.mean(best_cosines)) if best_cosines.size else np.nan,
+        "best_cosine_std": float(np.std(best_cosines)) if best_cosines.size else np.nan,
+        "matched_rank_mean": float(np.mean(matched_ranks)) if matched_ranks.size else np.nan,
+        "matched_rank_median": float(np.median(matched_ranks)) if matched_ranks.size else np.nan,
+        "top1_rate": float(np.mean(is_top1)) if is_top1.size else np.nan,
+        "top1_count": int(np.sum(is_top1)) if is_top1.size else 0,
     }
 
 
@@ -235,139 +297,122 @@ def main() -> None:
         print("No matches found above IoU threshold.")
         empty_summary = args.output_dir / "track_summary.csv"
         empty_matches = args.output_dir / "track_matches.csv"
+        empty_temporal = args.output_dir / "temporal_comparisons.csv"
         pd.DataFrame().to_csv(empty_summary, index=False)
         pd.DataFrame().to_csv(empty_matches, index=False)
+        pd.DataFrame().to_csv(empty_temporal, index=False)
         return
 
     matches_df = pd.DataFrame(match_rows)
     matches_df = matches_df.sort_values(["track_id", "frame_idx"]).reset_index(drop=True)
 
-    # Add cosine against first and previous within each track to the row-level CSV
-    sim_first_col = []
-    sim_prev_col = []
-    for _, g in matches_df.groupby("track_id", sort=True):
-        embs = np.stack(g["embedding"].to_numpy(), axis=0).astype(np.float32)
-        ref = embs[0]
-        for i, emb in enumerate(embs):
-            sim_first_col.append(cosine_similarity(emb, ref))
-            if i == 0:
-                sim_prev_col.append(np.nan)
-            else:
-                sim_prev_col.append(cosine_similarity(emb, embs[i - 1]))
-    matches_df["cosine_to_first"] = np.array(sim_first_col, dtype=np.float32)
-    matches_df["cosine_to_prev"] = np.array(sim_prev_col, dtype=np.float32)
-
-    # Save matches CSV without raw embedding vector column (too long), and with separate NPZ per track.
+    # Save GT-to-detection matches without raw embedding vectors.
     matches_csv = matches_df.drop(columns=["embedding"]).copy()
     matches_csv.to_csv(args.output_dir / "track_matches.csv", index=False)
 
+    temporal_rows = build_temporal_comparison_rows(matches_df, detections_by_frame)
+    temporal_csv_path = args.output_dir / "temporal_comparisons.csv"
+    if not temporal_rows:
+        pd.DataFrame().to_csv(temporal_csv_path, index=False)
+        pd.DataFrame().to_csv(args.output_dir / "track_summary.csv", index=False)
+        report = {
+            "detections_dir": str(args.detections_dir),
+            "tracks_txt": str(args.tracks_txt),
+            "iou_threshold": float(args.iou_thr),
+            "min_track_len": int(args.min_track_len),
+            "num_detection_files": len(det_files),
+            "num_frames_with_tracks": len(tracks_by_frame),
+            "num_matches": int(len(matches_df)),
+            "num_tracks_matched": int(matches_df["track_id"].nunique()),
+            "num_temporal_comparisons": 0,
+            "num_tracks_with_temporal_comparisons": 0,
+            "global_top1_rate": np.nan,
+            "global_matched_cosine_mean": np.nan,
+            "global_rank_mean": np.nan,
+        }
+        with (args.output_dir / "analysis_report.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(report.keys()))
+            writer.writeheader()
+            writer.writerow(report)
+        print("No valid consecutive t-1 -> t comparisons found after GT matching.")
+        return
+
+    temporal_df = pd.DataFrame(temporal_rows)
+    temporal_df = temporal_df.sort_values(["track_id", "frame_t"]).reset_index(drop=True)
+    temporal_df.to_csv(temporal_csv_path, index=False)
+
+    matched_track_lengths = matches_df.groupby("track_id").size().to_dict()
     summary_rows = []
-    all_sim_to_first: List[float] = []
+    all_matched_cosines: List[float] = []
 
-    eligible_groups = []
-    for track_id, group in matches_df.groupby("track_id", sort=True):
-        if len(group) < args.min_track_len:
+    for track_id, group in temporal_df.groupby("track_id", sort=True):
+        matched_track_length = int(matched_track_lengths.get(int(track_id), 0))
+        if matched_track_length < args.min_track_len:
             continue
-        eligible_groups.append((track_id, group))
-
-    for track_id, group in eligible_groups:
-        summary = summarize_track(group)
-        summary_rows.append({k: v for k, v in summary.items() if k not in {"embeddings", "sim_to_first", "consecutive_sim", "pairwise_matrix"}})
-
+        summary = summarize_temporal_track(group, matched_track_length)
+        summary_rows.append(summary)
         track_dir = args.output_dir / "per_track"
-        np.savez_compressed(
-            track_dir / f"track_{int(track_id):06d}.npz",
-            track_id=np.int32(track_id),
-            frame_idx=group["frame_idx"].to_numpy(dtype=np.int32),
-            embeddings=summary["embeddings"].astype(np.float32),
-            sim_to_first=summary["sim_to_first"].astype(np.float32),
-            consecutive_sim=summary["consecutive_sim"].astype(np.float32),
-            pairwise_cosine=summary["pairwise_matrix"].astype(np.float32),
-            iou=group["iou"].to_numpy(dtype=np.float32),
-            score=group["score"].to_numpy(dtype=np.float32),
-            label=group["label"].to_numpy(dtype=np.int32),
-        )
-
-        per_track_csv = group.drop(columns=["embedding"]).copy()
-        per_track_csv.to_csv(track_dir / f"track_{int(track_id):06d}_matches.csv", index=False)
-
-        all_sim_to_first.extend(summary["sim_to_first"].tolist())
+        group.to_csv(track_dir / f"track_{int(track_id):06d}_temporal.csv", index=False)
+        all_matched_cosines.extend(group["matched_cosine"].tolist())
 
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv(args.output_dir / "track_summary.csv", index=False)
 
     # Global histogram
-    if all_sim_to_first:
+    if all_matched_cosines:
         plt.figure(figsize=(8, 5))
-        plt.hist(all_sim_to_first, bins=30)
-        plt.title("Global cosine similarity to first embedding")
+        plt.hist(all_matched_cosines, bins=30)
+        plt.title("Global matched cosine similarity for t-1 -> t")
         plt.xlabel("Cosine similarity")
         plt.ylabel("Count")
         plt.tight_layout()
-        plt.savefig(args.output_dir / "plots" / "global_hist_similarity_to_first.png", dpi=160)
+        plt.savefig(args.output_dir / "plots" / "global_hist_matched_cosine_t_minus_1_to_t.png", dpi=160)
         plt.close()
 
     # Boxplot by track id
     if summary_rows:
-        top_track_ids = summary_df.sort_values("track_length", ascending=False)["track_id"].head(args.top_n_plots).astype(int).tolist()
+        top_track_ids = summary_df.sort_values("num_temporal_pairs", ascending=False)["track_id"].head(args.top_n_plots).astype(int).tolist()
         data = []
         labels = []
         for tid in top_track_ids:
-            g = matches_df[matches_df["track_id"] == tid].sort_values("frame_idx")
-            embs = np.stack(g["embedding"].to_numpy(), axis=0).astype(np.float32)
-            ref = embs[0]
-            sims = [cosine_similarity(e, ref) for e in embs]
-            data.append(sims)
+            g = temporal_df[temporal_df["track_id"] == tid].sort_values("frame_t")
+            data.append(g["matched_cosine"].tolist())
             labels.append(str(tid))
 
         if data:
             plt.figure(figsize=(max(8, len(data) * 0.45), 5))
             plt.boxplot(data, labels=labels, showfliers=False)
-            plt.title("Cosine similarity to first embedding by track")
+            plt.title("Matched cosine similarity by track for t-1 -> t")
             plt.xlabel("Track ID")
             plt.ylabel("Cosine similarity")
             plt.tight_layout()
-            plt.savefig(args.output_dir / "plots" / "boxplot_similarity_by_track.png", dpi=160)
+            plt.savefig(args.output_dir / "plots" / "boxplot_matched_cosine_by_track.png", dpi=160)
             plt.close()
 
-    # Per-track plots for top-N longest tracks
-    for tid in summary_df.sort_values("track_length", ascending=False)["track_id"].head(args.top_n_plots).astype(int).tolist() if not summary_df.empty else []:
-        g = matches_df[matches_df["track_id"] == tid].sort_values("frame_idx")
-        embs = np.stack(g["embedding"].to_numpy(), axis=0).astype(np.float32)
-        ref = embs[0]
-        sim_to_first = np.array([cosine_similarity(e, ref) for e in embs], dtype=np.float32)
-        frames = g["frame_idx"].to_numpy(dtype=np.int32)
+    # Per-track plots for top-N tracks with the most consecutive comparisons.
+    for tid in summary_df.sort_values("num_temporal_pairs", ascending=False)["track_id"].head(args.top_n_plots).astype(int).tolist() if not summary_df.empty else []:
+        g = temporal_df[temporal_df["track_id"] == tid].sort_values("frame_t")
+        matched_cosine = g["matched_cosine"].to_numpy(dtype=np.float32)
+        frames_t = g["frame_t"].to_numpy(dtype=np.int32)
 
         # Histogram per track
         plt.figure(figsize=(7, 4))
-        plt.hist(sim_to_first, bins=20)
-        plt.title(f"Track {tid} - histogram of cosine similarity to first")
+        plt.hist(matched_cosine, bins=20)
+        plt.title(f"Track {tid} - matched cosine histogram for t-1 -> t")
         plt.xlabel("Cosine similarity")
         plt.ylabel("Count")
         plt.tight_layout()
-        plt.savefig(args.output_dir / "plots" / f"track_{tid:06d}_hist.png", dpi=160)
+        plt.savefig(args.output_dir / "plots" / f"track_{tid:06d}_matched_cosine_hist.png", dpi=160)
         plt.close()
 
         # Timeline plot
         plt.figure(figsize=(8, 4))
-        plt.plot(frames, sim_to_first, marker="o", linewidth=1)
-        plt.title(f"Track {tid} - cosine similarity to first over time")
-        plt.xlabel("Frame index")
+        plt.plot(frames_t, matched_cosine, marker="o", linewidth=1)
+        plt.title(f"Track {tid} - matched cosine over time")
+        plt.xlabel("Frame t")
         plt.ylabel("Cosine similarity")
         plt.tight_layout()
-        plt.savefig(args.output_dir / "plots" / f"track_{tid:06d}_timeline.png", dpi=160)
-        plt.close()
-
-        # Pairwise heatmap
-        pairwise = pairwise_cosine_matrix(embs)
-        plt.figure(figsize=(6, 5))
-        plt.imshow(pairwise, vmin=-1.0, vmax=1.0, cmap="viridis")
-        plt.colorbar(label="Cosine similarity")
-        plt.title(f"Track {tid} - pairwise cosine similarity")
-        plt.xlabel("Occurrence index")
-        plt.ylabel("Occurrence index")
-        plt.tight_layout()
-        plt.savefig(args.output_dir / "plots" / f"track_{tid:06d}_pairwise_heatmap.png", dpi=160)
+        plt.savefig(args.output_dir / "plots" / f"track_{tid:06d}_matched_cosine_timeline.png", dpi=160)
         plt.close()
 
     # Save a brief run report
@@ -380,7 +425,12 @@ def main() -> None:
         "num_frames_with_tracks": len(tracks_by_frame),
         "num_matches": int(len(matches_df)),
         "num_tracks_matched": int(matches_df["track_id"].nunique()) if not matches_df.empty else 0,
+        "num_temporal_comparisons": int(len(temporal_df)),
+        "num_tracks_with_temporal_comparisons": int(temporal_df["track_id"].nunique()) if not temporal_df.empty else 0,
         "num_tracks_in_summary": int(len(summary_df)),
+        "global_top1_rate": float(temporal_df["is_top1_match"].mean()) if not temporal_df.empty else np.nan,
+        "global_matched_cosine_mean": float(temporal_df["matched_cosine"].mean()) if not temporal_df.empty else np.nan,
+        "global_rank_mean": float(temporal_df["matched_rank"].mean()) if not temporal_df.empty else np.nan,
     }
     with (args.output_dir / "analysis_report.csv").open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(report.keys()))
