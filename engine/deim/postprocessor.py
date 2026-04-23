@@ -49,6 +49,7 @@ class PostProcessor(nn.Module):
     # def forward(self, outputs, orig_target_sizes):
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
         logits, boxes = outputs['pred_logits'], outputs['pred_boxes']
+        embeddings = outputs.get('pred_embeddings', None)
         # orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt='cxcywh', out_fmt='xyxy')
@@ -61,6 +62,9 @@ class PostProcessor(nn.Module):
             labels = mod(index, self.num_classes)
             index = index // self.num_classes
             boxes = bbox_pred.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, bbox_pred.shape[-1]))
+            if embeddings is not None:
+                # Keep embeddings aligned with selected (query, class) top-k detections.
+                embeddings = embeddings.gather(dim=1, index=index.unsqueeze(-1).repeat(1, 1, embeddings.shape[-1]))
 
         else:
             scores = F.softmax(logits)[:, :, :-1]
@@ -69,8 +73,12 @@ class PostProcessor(nn.Module):
                 scores, index = torch.topk(scores, self.num_top_queries, dim=-1)
                 labels = torch.gather(labels, dim=1, index=index)
                 boxes = torch.gather(boxes, dim=1, index=index.unsqueeze(-1).tile(1, 1, boxes.shape[-1]))
+                if embeddings is not None:
+                    embeddings = torch.gather(embeddings, dim=1, index=index.unsqueeze(-1).tile(1, 1, embeddings.shape[-1]))
 
         if self.deploy_mode:
+            if embeddings is not None:
+                return labels, boxes, scores, embeddings
             return labels, boxes, scores
 
         if self.remap_mscoco_category:
@@ -79,8 +87,13 @@ class PostProcessor(nn.Module):
                 .to(boxes.device).reshape(labels.shape)
 
         results = []
-        for lab, box, sco in zip(labels, boxes, scores):
+        if embeddings is None:
+            embeddings = [None for _ in range(labels.shape[0])]
+
+        for lab, box, sco, emb in zip(labels, boxes, scores, embeddings):
             result = dict(labels=lab, boxes=box, scores=sco)
+            if emb is not None:
+                result['embeddings'] = emb
             results.append(result)
 
         return results
